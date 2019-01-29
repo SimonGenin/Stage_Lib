@@ -1,9 +1,18 @@
 import torch
-from pytorch_extension.TreeBaseConvolutionLayer import TreeBasedConvolutionLayer as tbcnn
+import torch.nn as nn
+
 from treelib import Tree
 
-if __name__ == '__main__':
+from pytorch_extension.TreeBasedConvolutionnalNeuralNetwork import MyNet
+from torchviz import make_dot, make_dot_from_trace
 
+from pytorch_extension.TreeBaseConvolutionLayer import TreeBasedConvolutionLayer as tbcl
+from pytorch_extension.TreeBasedMaxPoolingLayer import TreeBasedMaxPoolingLayer as tbmpl
+
+from tensorboardX import SummaryWriter
+
+
+if __name__ == '__main__':
     root_id = 0
     left_id = 1
     middle_id = 2
@@ -11,8 +20,8 @@ if __name__ == '__main__':
     bottom_left_id = 4
     bottom_right_id = 5
 
-    features = 5
-    N = 6
+    features = 30
+    N = 20
 
     tree = Tree()
     tree.create_node(data=root_id, identifier=root_id)
@@ -22,34 +31,47 @@ if __name__ == '__main__':
     tree.create_node(data=bottom_left_id, identifier=bottom_left_id, parent=left_id)
     tree.create_node(data=bottom_right_id, identifier=bottom_right_id, parent=left_id)
 
-    data = torch.randn(N, features, dtype=torch.float)
+    data = torch.randn(N, features, dtype=torch.float, requires_grad=True)
 
-    arg = 2
-    target = torch.ones(N, arg)
+    target = torch.randn(2) * 300
 
-    layer = tbcnn(tree, N, features, arg, 2)
-    layer2 = tbcnn(tree, N, arg, 2, 2)
+    net = MyNet(tree, N, features)
+    conv = tbcl(tree, N, features, ([3, 2], [2, 2], [4, 2]))
+    pool = tbmpl()
+    soft = nn.Softmax(dim=0)
+    linear = nn.Linear(3, 2)
 
-    criterion = torch.nn.MSELoss(reduction='sum')
-    optimizer = torch.optim.Adamax(layer.parameters(), lr=1e-3)
+    summary = SummaryWriter()
+    summary.add_graph(net, data)
+
+    criterion = torch.nn.MSELoss()
+    optimizer = torch.optim.SGD(net.parameters(), lr=1e-3)
+
     loss = None
+
+    y_pred = None
+
+
     for t in range(1000000):
-        # Forward pass: Compute predicted y by passing x to the model
-        y_pred = layer2(layer(data))
 
-        # Compute and print loss
+        y_pred = net(data)
+
         loss = criterion(y_pred, target)
-        if t % 1000 == 0:
-            print(t, loss.item())
 
-        if loss.item() < 0.0001:
-            break
+        if (t % 100 == 0):
+            print("Loss ", t, loss.item())
+            summary.add_scalar("loss", loss, t)
 
-        # Zero gradients, perform a backward pass, and update the weights.
+        if loss < 0.001: break;
+
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
+
     print("final loss:", loss.item())
     print(y_pred)
+    summary.close()
+
+    # make_dot(net.conv(data), params=dict(net.conv.named_parameters()))
 
