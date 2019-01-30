@@ -1,17 +1,17 @@
 from torch import nn
 import torch
 
-from pytorch_extension.TreeBaseConvolutionLayer import TreeBasedConvolutionLayer as tbcl
-from pytorch_extension.TreeBasedMaxPoolingLayer import TreeBasedMaxPoolingLayer as tbmpl
+from TreeBaseConvolutionLayer import TreeBasedConvolutionLayer as tbcl
+from TreeBasedMaxPoolingLayer import TreeBasedMaxPoolingLayer as tbmpl
 
 
 class MyNet(nn.Module):
 
     def __init__(self, tree, N, features):
         super(MyNet, self).__init__()
-        self.conv = tbcl(tree, N, features, ([2, 5], [2, 2], [2, 2]))
+        self.conv = tbcl(tree, N, features, ([1, 2], [2, 2], [3, 4]))
         self.pool = tbmpl()
-        self.linear = nn.Linear(3, 2)
+        self.linear = nn.Linear(self.conv.layer_dimension, 2)
 
     def forward(self, x):
 

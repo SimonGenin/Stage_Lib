@@ -12,6 +12,9 @@ numpy = "*"
 tensorflow = "*"
 tensorboardx = "*"
 pytorchviz = {git = "https://github.com/szagoruyko/pytorchviz"}
+asttokens = "*"
+plyplus = "*"
+pydot = "*"
 
 [requires]
 python_version = "3.6"

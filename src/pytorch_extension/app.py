@@ -3,14 +3,15 @@ import torch.nn as nn
 
 from treelib import Tree
 
-from pytorch_extension.TreeBasedConvolutionnalNeuralNetwork import MyNet
+from TreeBasedConvolutionnalNeuralNetwork import MyNet
 from torchviz import make_dot, make_dot_from_trace
 
-from pytorch_extension.TreeBaseConvolutionLayer import TreeBasedConvolutionLayer as tbcl
-from pytorch_extension.TreeBasedMaxPoolingLayer import TreeBasedMaxPoolingLayer as tbmpl
+from TreeBaseConvolutionLayer import TreeBasedConvolutionLayer as tbcl
+from TreeBasedMaxPoolingLayer import TreeBasedMaxPoolingLayer as tbmpl
 
 from tensorboardX import SummaryWriter
 
+import numpy as np
 
 if __name__ == '__main__':
     root_id = 0
@@ -33,7 +34,7 @@ if __name__ == '__main__':
 
     data = torch.randn(N, features, dtype=torch.float, requires_grad=True)
 
-    target = torch.randn(2) * 300
+    target = torch.tensor(np.arange(2), dtype=torch.float)
 
     net = MyNet(tree, N, features)
     conv = tbcl(tree, N, features, ([3, 2], [2, 2], [4, 2]))
@@ -47,31 +48,43 @@ if __name__ == '__main__':
     criterion = torch.nn.MSELoss()
     optimizer = torch.optim.SGD(net.parameters(), lr=1e-3)
 
+
     loss = None
 
     y_pred = None
+    y_after_softmax = None
 
+    for t in range(100):
 
-    for t in range(1000000):
+        y_after_linear = net(data)
 
-        y_pred = net(data)
+        y_after_softmax = soft(y_after_linear)
 
-        loss = criterion(y_pred, target)
+        # print(y_after_softmax)
 
-        if (t % 100 == 0):
+        # y_pred = torch.argmax(y_after_softmax)
+
+        # print(y_pred)
+
+        loss = criterion(y_after_softmax, target)
+
+        if t % 100 == 0:
             print("Loss ", t, loss.item())
+            print("y_pred is ", y_after_softmax)
+            print("Goal is ", target)
             summary.add_scalar("loss", loss, t)
 
-        if loss < 0.001: break;
+        if loss < 0.001: break
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+
+    make_dot(y_after_softmax.mean(), params=None).save('graph.dot', '.')
 
 
     print("final loss:", loss.item())
     print(y_pred)
     summary.close()
 
-    # make_dot(net.conv(data), params=dict(net.conv.named_parameters()))
-
+    # make_dot(net.conv(resources), params=dict(net.conv.named_parameters()))
