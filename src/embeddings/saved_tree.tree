@@ -1,0 +1,64 @@
+program
+├── classdef
+│   ├── name
+│   └── suite
+│       └── funcdef
+│           ├── name
+│           ├── parameters
+│           │   └── varargslist
+│           │       ├── vararg
+│           │       │   └── fpdef
+│           │       │       └── name
+│           │       ├── vararg
+│           │       │   └── fpdef
+│           │       │       └── name
+│           │       └── vararg
+│           │           ├── fpdef
+│           │           │   └── name
+│           │           └── number
+│           └── suite
+│               └── return_stmt
+│                   └── term
+│                       ├── name
+│                       ├── name
+│                       └── term_symbol
+└── classdef
+    ├── name
+    └── suite
+        ├── funcdef
+        │   ├── name
+        │   ├── parameters
+        │   │   └── varargslist
+        │   │       ├── vararg
+        │   │       │   └── fpdef
+        │   │       │       └── name
+        │   │       ├── vararg
+        │   │       │   └── fpdef
+        │   │       │       └── name
+        │   │       └── vararg
+        │   │           └── fpdef
+        │   │               └── name
+        │   └── suite
+        │       └── return_stmt
+        │           └── term
+        │               ├── name
+        │               ├── name
+        │               └── term_symbol
+        └── funcdef
+            ├── name
+            ├── parameters
+            │   └── varargslist
+            │       └── vararg
+            │           └── fpdef
+            │               └── name
+            └── suite
+                └── expr_stmt
+                    └── funccall
+                        ├── arglist
+                        │   ├── arg
+                        │   │   └── number
+                        │   └── arg
+                        │       └── number
+                        └── attrget
+                            ├── name
+                            └── name

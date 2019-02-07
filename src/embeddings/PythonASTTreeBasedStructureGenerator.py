@@ -10,12 +10,13 @@ class PythonASTTreeBasedStructureGenerator():
         self.node_collection = None
         self.program = None
         self.tree = Tree()
-        self.tree.create_node(data="program", identifier=0)
+        self.tree.create_node(data="program", identifier=0, tag="program")
         self.has_been_generated = False
 
     def from_file(self, filepath):
-        with open(filepath, "r") as file:
-            self.code = file.read()
+        file = open(filepath, "r")
+        self.code = file.read()
+        file.close()
         return self
 
     def from_code(self, str_code):
@@ -64,7 +65,7 @@ class PythonASTTreeBasedStructureGenerator():
                 if son_key == False: continue
 
                 current_id += 1
-                self.tree.create_node(data=son_key, parent=parent_id, identifier=current_id)
+                self.tree.create_node(data=son_key, parent=parent_id, identifier=current_id, tag=son_key)
                 current_id = self._fill_tree(son, current_id, current_id)
 
         return current_id
@@ -73,13 +74,11 @@ class PythonASTTreeBasedStructureGenerator():
         if not self.has_been_generated:
             self._generate()
         print(self.tree.show())
+        return self
 
     def print_ast_as_image(self, filename="AST.png"):
         if not self.has_been_generated:
             self._generate()
         self.program.to_png_with_pydot(filename)
+        return self
 
-
-gen = PythonASTTreeBasedStructureGenerator().from_file("../pytorch_extension/app.py")
-gen.print_tree()
-gen.print_ast_as_image()

@@ -1,0 +1,1365 @@
+# Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License"). You
+# may not use this file except in compliance with the License. A copy of
+# the License is located at
+#
+# http://aws.amazon.com/apache2.0/
+#
+# or in the "license" file accompanying this file. This file is
+# distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF
+# ANY KIND, either express or implied. See the License for the specific
+# language governing permissions and limitations under the License.
+"""Binary Event Stream Decoding """
+
+from binascii import crc32
+from struct import unpack
+from botocore.exceptions import EventStreamError
+
+# byte length of the prelude (total_length + header_length + prelude_crc)
+_PRELUDE_LENGTH = 12
+_MAX_HEADERS_LENGTH = 128 * 1024  # 128 Kb
+_MAX_PAYLOAD_LENGTH = 16 * 1024 ** 2  # 16 Mb
+
+
+class ParserError(Exception):
+    """Base binary flow encoding parsing exception.  """
+    pass
+
+
+class DuplicateHeader(ParserError):
+    """Duplicate header found in the event. """
+    def __init__(self, header):
+        message = 'Duplicate header present: "%s"' % header
+        super(DuplicateHeader, self).__init__(message)
+
+
+class InvalidHeadersLength(ParserError):
+    """Headers length is longer than the maximum. """
+    def __init__(self, length):
+        message = 'Header length of %s exceeded the maximum of %s' % (
+            length, _MAX_HEADERS_LENGTH
+        )
+        super(InvalidHeadersLength, self).__init__(message)
+
+
+class InvalidPayloadLength(ParserError):
+    """Payload length is longer than the maximum. """
+    def __init__(self, length):
+        message = 'Payload length of %s exceeded the maximum of %s' % (
+            length, _MAX_PAYLOAD_LENGTH
+        )
+        super(InvalidPayloadLength, self).__init__(message)
+
+
+class ChecksumMismatch(ParserError):
+    """Calculated checksum did not match the expected checksum. """
+    def __init__(self, expected, calculated):
+        message = 'Checksum mismatch: expected 0x%08x, calculated 0x%08x' % (
+            expected, calculated
+        )
+        super(ChecksumMismatch, self).__init__(message)
+
+
+class DecodeUtils(object):
+    """Unpacking utility functions used in the decoder.
+
+    All methods on this class take raw bytes and return  a tuple containing
+    the value parsed from the bytes and the number of bytes consumed to parse
+    that value.
+    """
+
+    UINT8_BYTE_FORMAT = '!B'
+    UINT16_BYTE_FORMAT = '!H'
+    UINT32_BYTE_FORMAT = '!I'
+    INT16_BYTE_FORMAT = '!h'
+    INT32_BYTE_FORMAT = '!i'
+    INT64_BYTE_FORMAT = '!q'
+    PRELUDE_BYTE_FORMAT = '!III'
+
+    # uint byte size to unpack format
+    UINT_BYTE_FORMAT = {
+        1: UINT8_BYTE_FORMAT,
+        2: UINT16_BYTE_FORMAT,
+        4: UINT32_BYTE_FORMAT,
+    }
+
+    @staticmethod
+    def unpack_true(data):
+        """This method consumes none of the provided bytes and returns True.
+
+        :type data: bytes
+        :param data: The bytes to parse from. This is ignored in this method.
+
+        :rtype: tuple
+        :rtype: (bool, int)
+        :returns: The tuple (True, 0)
+        """
+        return True, 0
+
+    @staticmethod
+    def unpack_false(data):
+        """This method consumes none of the provided bytes and returns False.
+
+        :type data: bytes
+        :param data: The bytes to parse from. This is ignored in this method.
+
+        :rtype: tuple
+        :rtype: (bool, int)
+        :returns: The tuple (False, 0)
+        """
+        return False, 0
+
+    @staticmethod
+    def unpack_uint8(data):
+        """Parse an unsigned 8-bit integer from the bytes.
+
+        :type data: bytes
+        :param data: The bytes to parse from.
+
+        :rtype: (int, int)
+        :returns: A tuple containing the (parsed integer value, bytes consumed)
+        """
+        value = unpack(DecodeUtils.UINT8_BYTE_FORMAT, data[:1])[0]
+        return value, 1
+
+    @staticmethod
+    def unpack_uint32(data):
+        """Parse an unsigned 32-bit integer from the bytes.
+
+        :type data: bytes
+        :param data: The bytes to parse from.
+
+        :rtype: (int, int)
+        :returns: A tuple containing the (parsed integer value, bytes consumed)
+        """
+        value = unpack(DecodeUtils.UINT32_BYTE_FORMAT, data[:4])[0]
+        return value, 4
+
+    @staticmethod
+    def unpack_int16(data):
+        """Parse a signed 16-bit integer from the bytes.
+
+        :type data: bytes
+        :param data: The bytes to parse from.
+
+        :rtype: tuple
+        :rtype: (int, int)
+        :returns: A tuple containing the (parsed integer value, bytes consumed)
+        """
+        value = unpack(DecodeUtils.INT16_BYTE_FORMAT, data[:2])[0]
+        return value, 2
+
+    @staticmethod
+    def unpack_int32(data):
+        """Parse a signed 32-bit integer from the bytes.
+
+        :type data: bytes
+        :param data: The bytes to parse from.
+
+        :rtype: tuple
+        :rtype: (int, int)
+        :returns: A tuple containing the (parsed integer value, bytes consumed)
+        """
+        value = unpack(DecodeUtils.INT32_BYTE_FORMAT, data[:4])[0]
+        return value, 4
+
+    @staticmethod
+    def unpack_int64(data):
+        """Parse a signed 64-bit integer from the bytes.
+
+        :type data: bytes
+        :param data: The bytes to parse from.
+
+        :rtype: tuple
+        :rtype: (int, int)
+        :returns: A tuple containing the (parsed integer value, bytes consumed)
+        """
+        value = unpack(DecodeUtils.INT64_BYTE_FORMAT, data[:8])[0]
+        return value, 8
+
+    @staticmethod
+    def unpack_byte_array(data, length_byte_size=2):
+        """Parse a variable length byte array from the bytes.
+
+        The bytes are expected to be in the following format:
+            [ length ][0 ... length bytes]
+        where length is an unsigned integer represented in the smallest number
+        of bytes to hold the maximum length of the array.
+
+        :type data: bytes
+        :param data: The bytes to parse from.
+
+        :type length_byte_size: int
+        :param length_byte_size: The byte size of the preceeding integer that
+        represents the length of the array. Supported values are 1, 2, and 4.
+
+        :rtype: (bytes, int)
+        :returns: A tuple containing the (parsed byte array, bytes consumed).
+        """
+        uint_byte_format = DecodeUtils.UINT_BYTE_FORMAT[length_byte_size]
+        length = unpack(uint_byte_format, data[:length_byte_size])[0]
+        bytes_end = length + length_byte_size
+        array_bytes = data[length_byte_size:bytes_end]
+        return array_bytes, bytes_end
+
+    @staticmethod
+    def unpack_utf8_string(data, length_byte_size=2):
+        """Parse a variable length utf-8 string from the bytes.
+
+        The bytes are expected to be in the following format:
+            [ length ][0 ... length bytes]
+        where length is an unsigned integer represented in the smallest number
+        of bytes to hold the maximum length of the array and the following
+        bytes are a valid utf-8 string.
+
+        :type data: bytes
+        :param bytes: The bytes to parse from.
+
+        :type length_byte_size: int
+        :param length_byte_size: The byte size of the preceeding integer that
+        represents the length of the array. Supported values are 1, 2, and 4.
+
+        :rtype: (str, int)
+        :returns: A tuple containing the (utf-8 string, bytes consumed).
+        """
+        array_bytes, consumed = DecodeUtils.unpack_byte_array(
+            data, length_byte_size)
+        return array_bytes.decode('utf-8'), consumed
+
+    @staticmethod
+    def unpack_uuid(data):
+        """Parse a 16-byte uuid from the bytes.
+
+        :type data: bytes
+        :param data: The bytes to parse from.
+
+        :rtype: (bytes, int)
+        :returns: A tuple containing the (uuid bytes, bytes consumed).
+        """
+        return data[:16], 16
+
+    @staticmethod
+    def unpack_prelude(data):
+        """Parse the prelude for an event stream message from the bytes.
+
+        The prelude for an event stream message has the following format:
+            [total_length][header_length][prelude_crc]
+        where each field is an unsigned 32-bit integer.
+
+        :rtype: ((int, int, int), int)
+        :returns: A tuple of ((total_length, headers_length, prelude_crc),
+        consumed)
+        """
+        return (unpack(DecodeUtils.PRELUDE_BYTE_FORMAT, data), _PRELUDE_LENGTH)
+
+
+def _validate_checksum(data, checksum, crc=0):
+    # To generate the same numeric value across all Python versions and
+    # platforms use crc32(data) & 0xffffffff.
+    computed_checksum = crc32(data, crc) & 0xFFFFFFFF
+    if checksum != computed_checksum:
+        raise ChecksumMismatch(checksum, computed_checksum)
+
+
+class MessagePrelude(object):
+    """Represents the prelude of an event stream message. """
+    def __init__(self, total_length, headers_length, crc):
+        self.total_length = total_length
+        self.headers_length = headers_length
+        self.crc = crc
+
+    @property
+    def payload_length(self):
+        """Calculates the total payload length.
+
+        The extra minus 4 bytes is for the message CRC.
+
+        :rtype: int
+        :returns: The total payload length.
+        """
+        return self.total_length - self.headers_length - _PRELUDE_LENGTH - 4
+
+    @property
+    def payload_end(self):
+        """Calculates the byte offset for the end of the message payload.
+
+        The extra minus 4 bytes is for the message CRC.
+
+        :rtype: int
+        :returns: The byte offset from the beginning of the event stream
+        message to the end of the payload.
+        """
+        return self.total_length - 4
+
+    @property
+    def headers_end(self):
+        """Calculates the byte offset for the end of the message headers.
+
+        :rtype: int
+        :returns: The byte offset from the beginning of the event stream
+        message to the end of the headers.
+        """
+        return _PRELUDE_LENGTH + self.headers_length
+
+
+class EventStreamMessage(object):
+    """Represents an event stream message. """
+    def __init__(self, prelude, headers, payload, crc):
+        self.prelude = prelude
+        self.headers = headers
+        self.payload = payload
+        self.crc = crc
+
+    def to_response_dict(self, status_code=200):
+        if self.headers.get(':message-type') == 'error':
+            status_code = 400
+        return {
+            'status_code': status_code,
+            'headers': self.headers,
+            'body': self.payload
+        }
+
+
+class EventStreamHeaderParser(object):
+    """ Parses the event headers from an event stream message.
+
+    Expects all of the header data upfront and creates a dictionary of headers
+    to return. This object can be reused multiple times to parse the headers
+    from multiple event stream messages.
+    """
+
+    # Maps header type to appropriate unpacking function
+    # These unpacking functions return the value and the amount unpacked
+    _HEADER_TYPE_MAP = {
+        # boolean_true
+        0: DecodeUtils.unpack_true,
+        # boolean_false
+        1: DecodeUtils.unpack_false,
+        # byte
+        2: DecodeUtils.unpack_uint8,
+        # short
+        3: DecodeUtils.unpack_int16,
+        # integer
+        4: DecodeUtils.unpack_int32,
+        # long
+        5: DecodeUtils.unpack_int64,
+        # byte_array
+        6: DecodeUtils.unpack_byte_array,
+        # string
+        7: DecodeUtils.unpack_utf8_string,
+        # timestamp
+        8: DecodeUtils.unpack_int64,
+        # uuid
+        9: DecodeUtils.unpack_uuid,
+    }
+
+    def __init__(self):
+        self._data = None
+
+    def parse(self, data):
+        """Parses the event stream headers from an event stream message.
+
+        :type data: bytes
+        :param data: The bytes that correspond to the headers section of an
+        event stream message.
+
+        :rtype: dict
+        :returns: A dicionary of header key, value pairs.
+        """
+        self._data = data
+        return self._parse_headers()
+
+    def _parse_headers(self):
+        headers = {}
+        while self._data:
+            name, value = self._parse_header()
+            if name in headers:
+                raise DuplicateHeader(name)
+            headers[name] = value
+        return headers
+
+    def _parse_header(self):
+        name = self._parse_name()
+        value = self._parse_value()
+        return name, value
+
+    def _parse_name(self):
+        name, consumed = DecodeUtils.unpack_utf8_string(self._data, 1)
+        self._advance_data(consumed)
+        return name
+
+    def _parse_type(self):
+        type, consumed = DecodeUtils.unpack_uint8(self._data)
+        self._advance_data(consumed)
+        return type
+
+    def _parse_value(self):
+        header_type = self._parse_type()
+        value_unpacker = self._HEADER_TYPE_MAP[header_type]
+        value, consumed = value_unpacker(self._data)
+        self._advance_data(consumed)
+        return value
+
+    def _advance_data(self, consumed):
+        self._data = self._data[consumed:]
+
+
+class EventStreamBuffer(object):
+    """Streaming based event stream buffer
+
+    A buffer class that wraps bytes from an event stream providing parsed
+    messages as they become available via an iterable interface.
+    """
+
+    def __init__(self):
+        self._data = b''
+        self._prelude = None
+        self._header_parser = EventStreamHeaderParser()
+
+    def add_data(self, data):
+        """Add data to the buffer.
+
+        :type data: bytes
+        :param data: The bytes to add to the buffer to be used when parsing
+        """
+        self._data += data
+
+    def _validate_prelude(self, prelude):
+        if prelude.headers_length > _MAX_HEADERS_LENGTH:
+            raise InvalidHeadersLength(prelude.headers_length)
+
+        if prelude.payload_length > _MAX_PAYLOAD_LENGTH:
+            raise InvalidPayloadLength(prelude.payload_length)
+
+    def _parse_prelude(self):
+        prelude_bytes = self._data[:_PRELUDE_LENGTH]
+        raw_prelude, _ = DecodeUtils.unpack_prelude(prelude_bytes)
+        prelude = MessagePrelude(*raw_prelude)
+        self._validate_prelude(prelude)
+        # The minus 4 removes the prelude crc from the bytes to be checked
+        _validate_checksum(prelude_bytes[:_PRELUDE_LENGTH-4], prelude.crc)
+        return prelude
+
+    def _parse_headers(self):
+        header_bytes = self._data[_PRELUDE_LENGTH:self._prelude.headers_end]
+        return self._header_parser.parse(header_bytes)
+
+    def _parse_payload(self):
+        prelude = self._prelude
+        payload_bytes = self._data[prelude.headers_end:prelude.payload_end]
+        return payload_bytes
+
+    def _parse_message_crc(self):
+        prelude = self._prelude
+        crc_bytes = self._data[prelude.payload_end:prelude.total_length]
+        message_crc, _ = DecodeUtils.unpack_uint32(crc_bytes)
+        return message_crc
+
+    def _parse_message_bytes(self):
+        # The minus 4 includes the prelude crc to the bytes to be checked
+        message_bytes = self._data[_PRELUDE_LENGTH-4:self._prelude.payload_end]
+        return message_bytes
+
+    def _validate_message_crc(self):
+        message_crc = self._parse_message_crc()
+        message_bytes = self._parse_message_bytes()
+        _validate_checksum(message_bytes, message_crc, crc=self._prelude.crc)
+        return message_crc
+
+    def _parse_message(self):
+        crc = self._validate_message_crc()
+        headers = self._parse_headers()
+        payload = self._parse_payload()
+        message = EventStreamMessage(self._prelude, headers, payload, crc)
+        self._prepare_for_next_message()
+        return message
+
+    def _prepare_for_next_message(self):
+        # Advance the data and reset the current prelude
+        self._data = self._data[self._prelude.total_length:]
+        self._prelude = None
+
+    def next(self):
+        """Provides the next available message parsed from the stream
+
+        :rtype: EventStreamMessage
+        :returns: The next event stream message
+        """
+        if len(self._data) < _PRELUDE_LENGTH:
+            raise StopIteration()
+
+        if self._prelude is None:
+            self._prelude = self._parse_prelude()
+
+        if len(self._data) < self._prelude.total_length:
+            raise StopIteration()
+
+        return self._parse_message()
+
+    def __next__(self):
+        return self.next()
+
+    def __iter__(self):
+        return self
+
+
+class EventStream(object):
+    """Wrapper class for an event stream body.
+
+    This wraps the underlying streaming body, parsing it for individual events
+    and yielding them as they come available through the iterator interface.
+
+    The following example uses the S3 select API to get structured data out of
+    an object stored in S3 using an event stream.
+
+    **Example:**
+    ::
+        from botocore.session import Session
+
+        s3 = Session().create_client('s3')
+        response = s3.select_object_content(
+            Bucket='bucketname',
+            Key='keyname',
+            ExpressionType='SQL',
+            RequestProgress={'Enabled': True},
+            Expression="SELECT * FROM S3Object s",
+            InputSerialization={'CSV': {}},
+            OutputSerialization={'CSV': {}},
+        )
+        # This is the event stream in the response
+        event_stream = response['Payload']
+        end_event_received = False
+        with open('output', 'wb') as f:
+            # Iterate over events in the event stream as they come
+            for event in event_stream:
+                # If we received a records event, write the data to a file
+                if 'Records' in event:
+                    data = event['Records']['Payload']
+                    f.write(data)
+                # If we received a progress event, print the details
+                elif 'Progress' in event:
+                    print(event['Progress']['Details'])
+                # End event indicates that the request finished successfully
+                elif 'End' in event:
+                    print('Result is complete')
+                    end_event_received = True
+        if not end_event_received:
+            raise Exception("End event not received, request incomplete.")
+    """
+    def __init__(self, raw_stream, output_shape, parser, operation_name):
+        self._raw_stream = raw_stream
+        self._output_shape = output_shape
+        self._operation_name = operation_name
+        self._parser = parser
+        self._buffer = EventStreamBuffer()
+
+    def __iter__(self):
+        for data in self._raw_stream.stream():
+            self._buffer.add_data(data)
+            for event in self._buffer:
+                parsed_event = self._parse_event(event)
+                if parsed_event:
+                    yield parsed_event
+
+    def _parse_event(self, event):
+        response_dict = event.to_response_dict()
+        parsed_response = self._parser.parse(response_dict, self._output_shape)
+        if response_dict['status_code'] == 200:
+            return parsed_response
+        else:
+            raise EventStreamError(parsed_response, self._operation_name)
+
+    def close(self):
+        """Closes the underlying streaming body. """
+        self._raw_stream.close()
+
+import torch
+import torch.nn as nn
+import numpy as np
+
+
+# noinspection PyMethodMayBeStatic
+class TreeBasedConvolutionLayer(nn.Module):
+    """
+    The kernel is the depth of the sliding window and the number of features to detect
+    """
+
+    def __init__(self, tree_model, batch_size, feature_size, kernels):
+
+        super(TreeBasedConvolutionLayer, self).__init__()
+
+        self.tree_model = tree_model
+        self.batch_size = batch_size
+        self.feature_size = feature_size
+
+        self.kernels = kernels
+        self.layer_dimension = len(self.kernels)
+
+        number_features_detection_id = 0
+        depth_of_sliding_window = 1
+
+        self.number_features_detection = [None] * self.layer_dimension
+        self.sliding_window_depth = [None] * self.layer_dimension
+
+        self.layer_weight_top = [None] * self.layer_dimension
+        self.layer_weight_right = [None] * self.layer_dimension
+        self.layer_weight_left = [None] * self.layer_dimension
+        self.layer_bias = [None] * self.layer_dimension
+
+        for i in range(self.layer_dimension):
+            self.number_features_detection[i] = self.kernels[i][number_features_detection_id]
+            self.sliding_window_depth[i] = self.kernels[i][depth_of_sliding_window]
+
+            self.layer_weight_top[i] = nn.Parameter(
+                torch.randn(self.kernels[i][number_features_detection_id], self.feature_size))
+            self.layer_weight_right[i] = nn.Parameter(
+                torch.randn(self.kernels[i][number_features_detection_id], self.feature_size))
+            self.layer_weight_left[i] = nn.Parameter(
+                torch.randn(self.kernels[i][number_features_detection_id], self.feature_size))
+            self.layer_bias[i] = nn.Parameter(torch.randn(self.kernels[i][number_features_detection_id]))
+
+        self.params = nn.ParameterList(
+            self.layer_weight_top + self.layer_weight_right + self.layer_weight_left + self.layer_bias)
+
+    def forward_one(self, i, tree_data):
+        convoluted_data = torch.zeros(self.batch_size, self.number_features_detection[i])
+
+        for (index, node) in enumerate(self.tree_model.all_nodes()):
+
+            current_window_position_node_id = node.data
+
+            current_node_depth = self.tree_model.level(current_window_position_node_id) + 1
+
+            hovered_nodes_by_window = list(self.tree_model.expand_tree(current_window_position_node_id,
+                                                                  mode=self.tree_model.WIDTH,
+                                                                  filter=lambda x: self.tree_model.level(
+                                                                      x.identifier) <= self.tree_model.level(
+                                                                      current_window_position_node_id) + self.sliding_window_depth[i] - 1))
+
+            # print("Hovered nodes are:", hovered_nodes_by_window)
+
+            summed_data = torch.zeros(self.number_features_detection[i])
+            for n_id in hovered_nodes_by_window:
+                # Prepare the coefficients for the continuous binary tree weights
+                twc = self.top_weight_coef(current_node_depth, i)
+                rwc = self.right_weight_coef(twc, self.get_siblings_number(n_id),
+                                             self.get_node_position_amongst_siblings(n_id))
+                lwc = self.left_weight_coef(twc, rwc)
+
+                # Prepare the convolution weight matrix
+                weight_convolution = twc * self.layer_weight_top[i] + lwc * self.layer_weight_left[i] + rwc * \
+                                     self.layer_weight_right[i]
+
+                # Get the sum ready for the convolution
+                summed_data = summed_data + (
+                        weight_convolution.mm(tree_data[n_id].unsqueeze(0).t()).t() + self.layer_bias[i])
+
+            convoluted_data[current_window_position_node_id] = torch.tanh(summed_data)
+
+        return convoluted_data
+
+    def forward(self, tree_data):
+
+        return [self.forward_one(i, tree_data) for i in range(self.layer_dimension)]
+
+    def top_weight_coef(self, node_depth, i):
+        return (node_depth - 1) / (self.sliding_window_depth[i] - 1)
+
+    def right_weight_coef(self, top_weight_coefficient, siblings_number, node_position):
+        return (1 - top_weight_coefficient) * ((node_position - 1) / max(1, siblings_number - 1))
+
+    def left_weight_coef(self, top_weight_coefficient, right_weight_coefficient):
+        return (1 - top_weight_coefficient) * (1 - right_weight_coefficient)
+
+    def get_siblings_number(self, node_id):
+        return len(self.tree_model.siblings(node_id))
+
+    def get_node_position_amongst_siblings(self, node_id):
+        if node_id == 0:
+            return 1
+
+        return next(
+            index for (index, node) in enumerate(self.tree_model.children(self.tree_model.parent(node_id).data)) if
+            node.data == node_id)
+
+import plyplus, plyplus.grammars
+from treelib import Tree
+
+
+class PythonASTTreeBasedStructureGenerator():
+
+    def __init__(self):
+        self.code = None
+        self.python_grammar = plyplus.Grammar(plyplus.grammars.open('python.g'))
+        self.node_collection = None
+        self.program = None
+        self.tree = Tree()
+        self.tree.create_node(data="program", identifier=0)
+        self.has_been_generated = False
+
+    def from_file(self, filepath):
+        file = open(filepath, "r")
+        self.code = file.read()
+        file.close()
+        return self
+
+    def from_code(self, str_code):
+        self.code = str_code
+        return self
+
+    def _generate(self):
+        self._parse_code()
+        self._fill_tree(self.program, 0, 0)
+        self.has_been_generated = True
+
+    def generate(self, as_copy=False):
+        if not self.has_been_generated:
+            self._generate()
+        if as_copy:
+            return Tree(self.tree)
+        return self.tree
+
+    def _parse_code(self):
+        parsed_code = self.python_grammar.parse(self.code)
+        tree_collection = parsed_code.select('*')
+
+        # remove the end tokens
+        new_list_of_nodes = []
+        for i in tree_collection:
+            if not isinstance(i, plyplus.plyplus.TokValue):
+                new_list_of_nodes.append(i)
+
+        self.node_collection = plyplus.strees.STreeCollection(new_list_of_nodes)
+        self.program = self.node_collection[0]
+
+    def _fill_tree(self, node, parent_id, current_id):
+
+        # print("node is", node, " parent id is", parent_id, "and current id is", current_id)
+
+        if isinstance(node, plyplus.plyplus.TokValue):
+            # print("token", node, "so we return")
+            return current_id
+
+        sons = node.named_tail  # dict
+
+        for son_key, son_value in sons.items():
+            for son in son_value:  # son being Stree
+
+                # we don't take the tokens (called False)
+                if son_key == False: continue
+
+                current_id += 1
+                self.tree.create_node(data=son_key, parent=parent_id, identifier=current_id)
+                current_id = self._fill_tree(son, current_id, current_id)
+
+        return current_id
+
+    def print_tree(self):
+        if not self.has_been_generated:
+            self._generate()
+        print(self.tree.show())
+        return self
+
+    def print_ast_as_image(self, filename="AST.png"):
+        if not self.has_been_generated:
+            self._generate()
+        self.program.to_png_with_pydot(filename)
+        return self
+
+# backend.py - execute rendering, open files in viewer
+
+import os
+import re
+import errno
+import platform
+import subprocess
+
+from ._compat import CalledProcessError, stderr_write_bytes
+
+from . import tools
+
+__all__ = [
+    'render', 'pipe', 'version', 'view',
+    'ENGINES', 'FORMATS', 'RENDERERS', 'FORMATTERS',
+    'ExecutableNotFound', 'RequiredArgumentError',
+]
+
+ENGINES = {  # http://www.graphviz.org/pdf/dot.1.pdf
+    'dot', 'neato', 'twopi', 'circo', 'fdp', 'sfdp', 'patchwork', 'osage',
+}
+
+FORMATS = {  # http://www.graphviz.org/doc/info/output.html
+    'bmp',
+    'canon', 'dot', 'gv', 'xdot', 'xdot1.2', 'xdot1.4',
+    'cgimage',
+    'cmap',
+    'eps',
+    'exr',
+    'fig',
+    'gd', 'gd2',
+    'gif',
+    'gtk',
+    'ico',
+    'imap', 'cmapx',
+    'imap_np', 'cmapx_np',
+    'ismap',
+    'jp2',
+    'jpg', 'jpeg', 'jpe',
+    'json', 'json0', 'dot_json', 'xdot_json',  # Graphviz 2.40
+    'pct', 'pict',
+    'pdf',
+    'pic',
+    'plain', 'plain-ext',
+    'png',
+    'pov',
+    'ps',
+    'ps2',
+    'psd',
+    'sgi',
+    'svg', 'svgz',
+    'tga',
+    'tif', 'tiff',
+    'tk',
+    'vml', 'vmlz',
+    'vrml',
+    'wbmp',
+    'webp',
+    'xlib',
+    'x11',
+}
+
+RENDERERS = {  # $ dot -T:
+    'cairo',
+    'dot',
+    'fig',
+    'gd',
+    'gdiplus',
+    'map',
+    'pic',
+    'pov',
+    'ps',
+    'svg',
+    'tk',
+    'vml',
+    'vrml',
+    'xdot',
+}
+
+FORMATTERS = {'cairo', 'core', 'gd', 'gdiplus', 'gdwbmp', 'xlib'}
+
+PLATFORM = platform.system().lower()
+
+
+class ExecutableNotFound(RuntimeError):
+    """Exception raised if the Graphviz executable is not found."""
+
+    _msg = ('failed to execute %r, '
+            'make sure the Graphviz executables are on your systems\' PATH')
+
+    def __init__(self, args):
+        super(ExecutableNotFound, self).__init__(self._msg % args)
+
+
+class RequiredArgumentError(Exception):
+    """Exception raised if a required argument is missing."""
+
+
+def command(engine, format, filepath=None, renderer=None, formatter=None):
+    """Return args list for ``subprocess.Popen`` and name of the rendered file."""
+    if formatter is not None and renderer is None:
+        raise RequiredArgumentError('formatter given without renderer')
+
+    if engine not in ENGINES:
+        raise ValueError('unknown engine: %r' % engine)
+    if format not in FORMATS:
+        raise ValueError('unknown format: %r' % format)
+    if renderer is not None and renderer not in RENDERERS:
+        raise ValueError('unknown renderer: %r' % renderer)
+    if formatter is not None and formatter not in FORMATTERS:
+        raise ValueError('unknown formatter: %r' % formatter)
+
+    format_arg = [s for s in (format, renderer, formatter) if s is not None]
+    suffix = '.'.join(reversed(format_arg))
+    format_arg = ':'.join(format_arg)
+
+    cmd = [engine, '-T%s' % format_arg]
+    rendered = None
+    if filepath is not None:
+        cmd.extend(['-O', filepath])
+        rendered = '%s.%s' % (filepath, suffix)
+
+    return cmd, rendered
+
+
+if PLATFORM == 'windows':  # pragma: no cover
+    def get_startupinfo():
+        """Return subprocess.STARTUPINFO instance hiding the console window."""
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+        return startupinfo
+else:
+    def get_startupinfo():
+        """Return None for startupinfo argument of ``subprocess.Popen``."""
+        return None
+
+
+def run(cmd, input=None, capture_output=False, check=False, quiet=False, **kwargs):
+    """Run the command described by cmd and return its (stdout, stderr) tuple."""
+    if input is not None:
+        kwargs['stdin'] = subprocess.PIPE
+    if capture_output:
+        kwargs['stdout'] = kwargs['stderr'] = subprocess.PIPE
+
+    try:
+        proc = subprocess.Popen(cmd, startupinfo=get_startupinfo(), **kwargs)
+    except OSError as e:
+        if e.errno == errno.ENOENT:
+            raise ExecutableNotFound(cmd)
+        else:  # pragma: no cover
+            raise
+
+    out, err = proc.communicate(input)
+
+    if not quiet and err:
+        stderr_write_bytes(err, flush=True)
+    if check and proc.returncode:
+        raise CalledProcessError(proc.returncode, cmd, output=out, stderr=err)
+
+    return out, err
+
+
+def render(engine, format, filepath, renderer=None, formatter=None, quiet=False):
+    """Render file with Graphviz ``engine`` into ``format``,  return result filename.
+
+    Args:
+        engine: The layout commmand used for rendering (``'dot'``, ``'neato'``, ...).
+        format: The output format used for rendering (``'pdf'``, ``'png'``, ...).
+        filepath: Path to the DOT source file to render.
+        renderer: The output renderer used for rendering (``'cairo'``, ``'gd'``, ...).
+        formatter: The output formatter used for rendering (``'cairo'``, ``'gd'``, ...).
+        quiet (bool): Suppress ``stderr`` output.
+    Returns:
+        The (possibly relative) path of the rendered file.
+    Raises:
+        ValueError: If ``engine``, ``format``, ``renderer``, or ``formatter`` are not known.
+        graphviz.RequiredArgumentError: If ``formatter`` is given but ``renderer`` is None.
+        graphviz.ExecutableNotFound: If the Graphviz executable is not found.
+        subprocess.CalledProcessError: If the exit status is non-zero.
+    """
+    cmd, rendered = command(engine, format, filepath, renderer, formatter)
+    run(cmd, capture_output=True, check=True, quiet=quiet)
+    return rendered
+
+
+def pipe(engine, format, data, renderer=None, formatter=None, quiet=False):
+    """Return ``data`` piped through Graphviz ``engine`` into ``format``.
+
+    Args:
+        engine: The layout commmand used for rendering (``'dot'``, ``'neato'``, ...).
+        format: The output format used for rendering (``'pdf'``, ``'png'``, ...).
+        data: The binary (encoded) DOT source string to render.
+        renderer: The output renderer used for rendering (``'cairo'``, ``'gd'``, ...).
+        formatter: The output formatter used for rendering (``'cairo'``, ``'gd'``, ...).
+        quiet (bool): Suppress ``stderr`` output.
+    Returns:
+        Binary (encoded) stdout of the layout command.
+    Raises:
+        ValueError: If ``engine``, ``format``, ``renderer``, or ``formatter`` are not known.
+        graphviz.RequiredArgumentError: If ``formatter`` is given but ``renderer`` is None.
+        graphviz.ExecutableNotFound: If the Graphviz executable is not found.
+        subprocess.CalledProcessError: If the exit status is non-zero.
+    """
+    cmd, _ = command(engine, format, None, renderer, formatter)
+    out, _ = run(cmd, input=data, capture_output=True, check=True, quiet=quiet)
+    return out
+
+
+def version():
+    """Return the version number tuple from the ``stderr`` output of ``dot -V``.
+
+    Returns:
+        Two or three ``int`` version ``tuple``.
+    Raises:
+        graphviz.ExecutableNotFound: If the Graphviz executable is not found.
+        subprocess.CalledProcessError: If the exit status is non-zero.
+        RuntimmeError: If the output cannot be parsed into a version number.
+    """
+    cmd = ['dot', '-V']
+    out, _ = run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+    info = out.decode('ascii')
+    ma = re.search(r'graphviz version (\d+\.\d+(?:\.\d+)?) ', info)
+    if ma is None:
+        raise RuntimeError
+    return tuple(int(d) for d in ma.group(1).split('.'))
+
+
+def view(filepath):
+    """Open filepath with its default viewing application (platform-specific).
+
+    Args:
+        filepath: Path to the file to open in viewer.
+    Raises:
+        RuntimeError: If the current platform is not supported.
+    """
+    try:
+        view_func = getattr(view, PLATFORM)
+    except AttributeError:
+        raise RuntimeError('platform %r not supported' % PLATFORM)
+    view_func(filepath)
+
+
+@tools.attach(view, 'darwin')
+def view_darwin(filepath):
+    """Open filepath with its default application (mac)."""
+    subprocess.Popen(['open', filepath])
+
+
+@tools.attach(view, 'linux')
+@tools.attach(view, 'freebsd')
+def view_unixoid(filepath):
+    """Open filepath in the user's preferred application (linux, freebsd)."""
+    subprocess.Popen(['xdg-open', filepath])
+
+
+@tools.attach(view, 'windows')
+def view_windows(filepath):
+    """Start filepath with its associated application (windows)."""
+    os.startfile(os.path.normpath(filepath))
+
+
+"""Generate and work with PEP 425 Compatibility Tags."""
+
+import distutils.util
+import platform
+import sys
+import sysconfig
+import warnings
+
+try:
+    from importlib.machinery import get_all_suffixes
+except ImportError:
+    from imp import get_suffixes as get_all_suffixes
+
+
+def get_config_var(var):
+    try:
+        return sysconfig.get_config_var(var)
+    except IOError as e:  # pip Issue #1074
+        warnings.warn("{0}".format(e), RuntimeWarning)
+        return None
+
+
+def get_abbr_impl():
+    """Return abbreviated implementation name."""
+    impl = platform.python_implementation()
+    if impl == 'PyPy':
+        return 'pp'
+    elif impl == 'Jython':
+        return 'jy'
+    elif impl == 'IronPython':
+        return 'ip'
+    elif impl == 'CPython':
+        return 'cp'
+
+    raise LookupError('Unknown Python implementation: ' + impl)
+
+
+def get_impl_ver():
+    """Return implementation version."""
+    impl_ver = get_config_var("py_version_nodot")
+    if not impl_ver or get_abbr_impl() == 'pp':
+        impl_ver = ''.join(map(str, get_impl_version_info()))
+    return impl_ver
+
+
+def get_impl_version_info():
+    """Return sys.version_info-like tuple for use in decrementing the minor
+    version."""
+    if get_abbr_impl() == 'pp':
+        # as per https://github.com/pypa/pip/issues/2882
+        return (sys.version_info[0], sys.pypy_version_info.major,
+                sys.pypy_version_info.minor)
+    else:
+        return sys.version_info[0], sys.version_info[1]
+
+
+def get_flag(var, fallback, expected=True, warn=True):
+    """Use a fallback method for determining SOABI flags if the needed config
+    var is unset or unavailable."""
+    val = get_config_var(var)
+    if val is None:
+        if warn:
+            warnings.warn("Config variable '{0}' is unset, Python ABI tag may "
+                          "be incorrect".format(var), RuntimeWarning, 2)
+        return fallback()
+    return val == expected
+
+
+def get_abi_tag():
+    """Return the ABI tag based on SOABI (if available) or emulate SOABI
+    (CPython 2, PyPy)."""
+    soabi = get_config_var('SOABI')
+    impl = get_abbr_impl()
+    if not soabi and impl in ('cp', 'pp') and hasattr(sys, 'maxunicode'):
+        d = ''
+        m = ''
+        u = ''
+        if get_flag('Py_DEBUG',
+                    lambda: hasattr(sys, 'gettotalrefcount'),
+                    warn=(impl == 'cp')):
+            d = 'd'
+        if get_flag('WITH_PYMALLOC',
+                    lambda: impl == 'cp',
+                    warn=(impl == 'cp')):
+            m = 'm'
+        if get_flag('Py_UNICODE_SIZE',
+                    lambda: sys.maxunicode == 0x10ffff,
+                    expected=4,
+                    warn=(impl == 'cp' and
+                          sys.version_info < (3, 3))) \
+                and sys.version_info < (3, 3):
+            u = 'u'
+        abi = '%s%s%s%s%s' % (impl, get_impl_ver(), d, m, u)
+    elif soabi and soabi.startswith('cpython-'):
+        abi = 'cp' + soabi.split('-')[1]
+    elif soabi:
+        abi = soabi.replace('.', '_').replace('-', '_')
+    else:
+        abi = None
+    return abi
+
+
+def get_platform():
+    """Return our platform name 'win32', 'linux_x86_64'"""
+    # XXX remove distutils dependency
+    result = distutils.util.get_platform().replace('.', '_').replace('-', '_')
+    if result == "linux_x86_64" and sys.maxsize == 2147483647:
+        # pip pull request #3497
+        result = "linux_i686"
+    return result
+
+
+def get_supported(versions=None, supplied_platform=None):
+    """Return a list of supported tags for each version specified in
+    `versions`.
+
+    :param versions: a list of string versions, of the form ["33", "32"],
+        or None. The first version will be assumed to support our ABI.
+    """
+    supported = []
+
+    # Versions must be given with respect to the preference
+    if versions is None:
+        versions = []
+        version_info = get_impl_version_info()
+        major = version_info[:-1]
+        # Support all previous minor Python versions.
+        for minor in range(version_info[-1], -1, -1):
+            versions.append(''.join(map(str, major + (minor,))))
+
+    impl = get_abbr_impl()
+
+    abis = []
+
+    abi = get_abi_tag()
+    if abi:
+        abis[0:0] = [abi]
+
+    abi3s = set()
+    for suffix in get_all_suffixes():
+        if suffix[0].startswith('.abi'):
+            abi3s.add(suffix[0].split('.', 2)[1])
+
+    abis.extend(sorted(list(abi3s)))
+
+    abis.append('none')
+
+    platforms = []
+    if supplied_platform:
+        platforms.append(supplied_platform)
+    platforms.append(get_platform())
+
+    # Current version, current API (built specifically for our Python):
+    for abi in abis:
+        for arch in platforms:
+            supported.append(('%s%s' % (impl, versions[0]), abi, arch))
+
+    # abi3 modules compatible with older version of Python
+    for version in versions[1:]:
+        # abi3 was introduced in Python 3.2
+        if version in ('31', '30'):
+            break
+        for abi in abi3s:   # empty set if not Python 3
+            for arch in platforms:
+                supported.append(("%s%s" % (impl, version), abi, arch))
+
+    # No abi / arch, but requires our implementation:
+    for i, version in enumerate(versions):
+        supported.append(('%s%s' % (impl, version), 'none', 'any'))
+        if i == 0:
+            # Tagged specifically as being cross-version compatible
+            # (with just the major version specified)
+            supported.append(('%s%s' % (impl, versions[0][0]), 'none', 'any'))
+
+    # Major Python version + platform; e.g. binaries not using the Python API
+    for arch in platforms:
+        supported.append(('py%s' % (versions[0][0]), 'none', arch))
+
+    # No abi / arch, generic Python
+    for i, version in enumerate(versions):
+        supported.append(('py%s' % (version,), 'none', 'any'))
+        if i == 0:
+            supported.append(('py%s' % (version[0]), 'none', 'any'))
+
+    return supported
+
+from __future__ import absolute_import
+
+import os
+import sys
+
+# If we are running from a wheel, add the wheel to sys.path
+# This allows the usage python pip-*.whl/pip install pip-*.whl
+if __package__ == '':
+    # __file__ is pip-*.whl/pip/__main__.py
+    # first dirname call strips of '/__main__.py', second strips off '/pip'
+    # Resulting path is the name of the wheel itself
+    # Add that to sys.path so we can import pip
+    path = os.path.dirname(os.path.dirname(__file__))
+    sys.path.insert(0, path)
+
+from pip._internal import main as _main  # isort:skip # noqa
+
+if __name__ == '__main__':
+    sys.exit(_main())
+
+# coding=utf-8
+"""Generate code from an annotated syntax tree."""
+# Copyright 2017 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
+import collections
+
+from pasta.base import annotate
+from pasta.base import formatting as fmt
+
+
+class PrintError(Exception):
+    """An exception for when we failed to print the tree."""
+
+
+class Printer(annotate.BaseVisitor):
+    """Traverses an AST and generates formatted python source code.
+
+    This uses the same base visitor as annotating the AST, but instead of eating a
+    token it spits one out. For special formatting information which was stored on
+    the node, this is output exactly as it was read in unless one or more of the
+    dependency attributes used to generate it has changed, in which case its
+    default formatting is used.
+    """
+
+    def __init__(self):
+        super(Printer, self).__init__()
+        self.code = ''
+
+    def visit(self, node):
+        node._printer_info = collections.defaultdict(lambda: False)
+        try:
+            super(Printer, self).visit(node)
+        except (TypeError, ValueError, IndexError, KeyError) as e:
+            raise PrintError(e)
+        del node._printer_info
+
+    def visit_Num(self, node):
+        self.prefix(node)
+        content = fmt.get(node, 'content')
+        self.code += content if content is not None else repr(node.n)
+        self.suffix(node)
+
+    def visit_Str(self, node):
+        self.prefix(node)
+        content = fmt.get(node, 'content')
+        self.code += content if content is not None else repr(node.s)
+        self.suffix(node)
+
+    def visit_Bytes(self, node):
+        self.prefix(node)
+        content = fmt.get(node, 'content')
+        self.code += content if content is not None else repr(node.s)
+        self.suffix(node)
+
+    def token(self, value):
+        self.code += value
+
+    def optional_token(self, node, attr_name, token_val,
+                       allow_whitespace_prefix=False, default=False):
+        del allow_whitespace_prefix
+        value = fmt.get(node, attr_name)
+        if value is None and default:
+            value = token_val
+        self.code += value or ''
+
+    def attr(self, node, attr_name, attr_vals, deps=None, default=None):
+        """Add the formatted data stored for a given attribute on this node.
+
+        If any of the dependent attributes of the node have changed since it was
+        annotated, then the stored formatted data for this attr_name is no longer
+        valid, and we must use the default instead.
+
+        Arguments:
+          node: (ast.AST) An AST node to retrieve formatting information from.
+          attr_name: (string) Name to load the formatting information from.
+          attr_vals: (list of functions/strings) Unused here.
+          deps: (optional, set of strings) Attributes of the node which the stored
+            formatting data depends on.
+          default: (string) Default formatted data for this attribute.
+        """
+        del attr_vals
+        if not hasattr(node, '_printer_info') or node._printer_info[attr_name]:
+            return
+        node._printer_info[attr_name] = True
+        val = fmt.get(node, attr_name)
+        if (val is None or deps and
+                any(getattr(node, dep, None) != fmt.get(node, dep + '__src')
+                    for dep in deps)):
+            val = default
+        self.code += val if val is not None else ''
+
+    def check_is_elif(self, node):
+        try:
+            return fmt.get(node, 'is_elif')
+        except AttributeError:
+            return False
+
+    def check_is_continued_try(self, node):
+        # TODO: Don't set extra attributes on nodes
+        return getattr(node, 'is_continued', False)
+
+    def check_is_continued_with(self, node):
+        # TODO: Don't set extra attributes on nodes
+        return getattr(node, 'is_continued', False)
+
+
+def to_str(tree):
+    """Convenient function to get the python source for an AST."""
+    p = Printer()
+    p.visit(tree)
+    return p.code

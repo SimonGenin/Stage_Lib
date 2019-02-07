@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import numpy as np
+from timeit import default_timer as timer
 
 
 # noinspection PyMethodMayBeStatic
@@ -9,12 +10,11 @@ class TreeBasedConvolutionLayer(nn.Module):
     The kernel is the depth of the sliding window and the number of features to detect
     """
 
-    def __init__(self, tree_model, batch_size, feature_size, kernels):
+    def __init__(self, feature_size, kernels):
 
         super(TreeBasedConvolutionLayer, self).__init__()
 
-        self.tree_model = tree_model
-        self.batch_size = batch_size
+        self.tree_model = None
         self.feature_size = feature_size
 
         self.kernels = kernels
@@ -47,7 +47,7 @@ class TreeBasedConvolutionLayer(nn.Module):
             self.layer_weight_top + self.layer_weight_right + self.layer_weight_left + self.layer_bias)
 
     def forward_one(self, i, tree_data):
-        convoluted_data = torch.zeros(self.batch_size, self.number_features_detection[i])
+        convoluted_data = torch.zeros(tree_data.shape[0], self.number_features_detection[i])
 
         for (index, node) in enumerate(self.tree_model.all_nodes()):
 
@@ -55,16 +55,12 @@ class TreeBasedConvolutionLayer(nn.Module):
 
             current_node_depth = self.tree_model.level(current_window_position_node_id) + 1
 
-            hovered_nodes_by_window = list(self.tree_model.expand_tree(current_window_position_node_id,
-                                                                  mode=self.tree_model.WIDTH,
-                                                                  filter=lambda x: self.tree_model.level(
-                                                                      x.identifier) <= self.tree_model.level(
-                                                                      current_window_position_node_id) + self.sliding_window_depth[i] - 1))
-
-            # print("Hovered nodes are:", hovered_nodes_by_window)
+            hovered_nodes_by_window = self._get_hovered_nodes_by_window(i, current_window_position_node_id)
 
             summed_data = torch.zeros(self.number_features_detection[i])
+
             for n_id in hovered_nodes_by_window:
+
                 # Prepare the coefficients for the continuous binary tree weights
                 twc = self.top_weight_coef(current_node_depth, i)
                 rwc = self.right_weight_coef(twc, self.get_siblings_number(n_id),
@@ -83,12 +79,22 @@ class TreeBasedConvolutionLayer(nn.Module):
 
         return convoluted_data
 
-    def forward(self, tree_data):
+    def _get_hovered_nodes_by_window(self, i, current_window_position_node_id):
+        return list(
+            self.tree_model.expand_tree(
+                current_window_position_node_id,
+                mode=self.tree_model.WIDTH,
+                filter=
+                lambda x: self.tree_model.level(x.identifier)
+                          <= self.tree_model.level(current_window_position_node_id) + self.sliding_window_depth[i] - 1)
+        )
 
+    def forward(self, tree_data, tree_model):
+        self.tree_model = tree_model
         return [self.forward_one(i, tree_data) for i in range(self.layer_dimension)]
 
     def top_weight_coef(self, node_depth, i):
-        return (node_depth - 1) / (self.sliding_window_depth[i] - 1)
+        return (node_depth - 1) / max(1, (self.sliding_window_depth[i] - 1))
 
     def right_weight_coef(self, top_weight_coefficient, siblings_number, node_position):
         return (1 - top_weight_coefficient) * ((node_position - 1) / max(1, siblings_number - 1))
@@ -100,6 +106,7 @@ class TreeBasedConvolutionLayer(nn.Module):
         return len(self.tree_model.siblings(node_id))
 
     def get_node_position_amongst_siblings(self, node_id):
+
         if node_id == 0:
             return 1
 

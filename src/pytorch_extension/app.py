@@ -1,90 +1,121 @@
+import datetime
+
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
-
-from treelib import Tree
-
-from TreeBasedConvolutionnalNeuralNetwork import MyNet
-from torchviz import make_dot, make_dot_from_trace
-
-from TreeBaseConvolutionLayer import TreeBasedConvolutionLayer as tbcl
-from TreeBasedMaxPoolingLayer import TreeBasedMaxPoolingLayer as tbmpl
+from timeit import default_timer as timer
 
 from tensorboardX import SummaryWriter
 
-import numpy as np
+from TreeBasedConvolutionnalNeuralNetwork import TreeBasedConvolutionnalNeuralNetwork as tbcnn
+
+from embedding_loaders import load_embeddings_df, load_simpler_one_hot_encoded_embedding_df, load_dummy_embedding_df
+from source_code_loaders import load_source_codes
+
+
+def generate_kernels(f, d):
+    for i in range(1, f):
+        for j in range(1, d):
+            yield (i, j)
+
 
 if __name__ == '__main__':
-    root_id = 0
-    left_id = 1
-    middle_id = 2
-    right_id = 3
-    bottom_left_id = 4
-    bottom_right_id = 5
 
-    features = 30
-    N = 20
+    # Prepare tensorboard elements
+    tensorboard = SummaryWriter()
 
-    tree = Tree()
-    tree.create_node(data=root_id, identifier=root_id)
-    tree.create_node(data=left_id, identifier=left_id, parent=root_id)
-    tree.create_node(data=middle_id, identifier=middle_id, parent=root_id)
-    tree.create_node(data=right_id, identifier=right_id, parent=root_id)
-    tree.create_node(data=bottom_left_id, identifier=bottom_left_id, parent=left_id)
-    tree.create_node(data=bottom_right_id, identifier=bottom_right_id, parent=left_id)
+    # Get the python embedding vectors
+    start = timer()
+    embeddings_df, number_of_features_per_vector = load_dummy_embedding_df('python_stage')
+    end = timer()
+    print("Embeddings loaded in", end - start)
 
-    data = torch.randn(N, features, dtype=torch.float, requires_grad=True)
+    # How many programs are going to be used to train our model ?
+    number_of_programs_for_training = 2
 
-    target = torch.tensor(np.arange(2), dtype=torch.float)
+    # How many epochs do we want ?
+    number_of_epochs = 50
 
-    net = MyNet(tree, N, features)
-    conv = tbcl(tree, N, features, ([3, 2], [2, 2], [4, 2]))
-    pool = tbmpl()
+    # Our beautiful neural network
+    net = tbcnn(number_of_features_per_vector, kernels=[(2, 2)], linear_output=2)
     soft = nn.Softmax(dim=0)
-    linear = nn.Linear(3, 2)
 
-    summary = SummaryWriter()
-    summary.add_graph(net, data)
+    # How are we going to train our nn ?
+    criterion = torch.nn.BCELoss()
+    optimizer = torch.optim.SGD(net.parameters(), lr=3)
 
-    criterion = torch.nn.MSELoss()
-    optimizer = torch.optim.SGD(net.parameters(), lr=1e-3)
-
-
+    # Some global variables for logging
     loss = None
 
-    y_pred = None
-    y_after_softmax = None
+    # Load the data and tree structures we need
+    start = timer()
+    loaded_procedure_programs_data, \
+    loaded_procedure_programs_tree, \
+    loaded_function_programs_data, \
+    loaded_function_programs_tree = load_source_codes(number_of_programs_for_training, embeddings_df)
+    end = timer()
+    print("Data & trees loaded in", end - start)
 
-    for t in range(100):
-
-        y_after_linear = net(data)
-
-        y_after_softmax = soft(y_after_linear)
-
-        # print(y_after_softmax)
-
-        # y_pred = torch.argmax(y_after_softmax)
-
-        # print(y_pred)
-
-        loss = criterion(y_after_softmax, target)
-
-        if t % 100 == 0:
-            print("Loss ", t, loss.item())
-            print("y_pred is ", y_after_softmax)
-            print("Goal is ", target)
-            summary.add_scalar("loss", loss, t)
-
-        if loss < 0.001: break
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-    make_dot(y_after_softmax.mean(), params=None).save('graph.dot', '.')
+    y_expected_for_procedures = torch.tensor([1, 0], dtype=torch.float)
+    y_expected_for_functions = torch.tensor([0, 1], dtype=torch.float)
 
 
-    print("final loss:", loss.item())
-    print(y_pred)
-    summary.close()
+    net.train()
 
-    # make_dot(net.conv(resources), params=dict(net.conv.named_parameters()))
+    for current_epoch in range(number_of_epochs):
+
+        start_epoch = timer()
+
+        for current_program in range(number_of_programs_for_training):
+
+            # Learn a procedure
+            data = loaded_procedure_programs_data[current_program]
+
+            y_pred = net(data, loaded_procedure_programs_tree[current_program])
+
+            print(y_pred)
+
+            loss = criterion(y_pred, y_expected_for_procedures)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        # Give some feedback on the epoch
+        print()
+        print("Half Epoch, after proc :", current_epoch)
+        print("Loss  :", loss.item())
+        print()
+
+        for current_program in range(number_of_programs_for_training):
+
+            # Learn a function
+            data = loaded_function_programs_data[current_program]
+
+            y_pred = net(data, loaded_function_programs_tree[current_program])
+
+            print(y_pred)
+
+            loss = criterion(y_pred, y_expected_for_functions)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        end_epoch = timer()
+
+        # Give some feedback on the epoch
+        print()
+        print("Half Epoch, after func :", current_epoch)
+        print("Loss  :", loss.item())
+        print("Time  :", str(datetime.timedelta(seconds=int(end_epoch - start_epoch))))
+        print()
+
+        # if loss < 0.001:
+        #     print("Loss is less than 0.001, early stopping the net")
+        #     break
+
+    timestamp = datetime.datetime.now().isoformat()
+    # torch.save(net, 'tbcnn_' + str(timestamp) + '.pt')
+    torch.save(net, 'tbcnn_keep.pt')

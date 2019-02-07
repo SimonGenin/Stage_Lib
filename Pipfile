@@ -12,9 +12,12 @@ numpy = "*"
 tensorflow = "*"
 tensorboardx = "*"
 pytorchviz = {git = "https://github.com/szagoruyko/pytorchviz"}
-asttokens = "*"
 plyplus = "*"
 pydot = "*"
+pandas = "*"
+tqdm = "*"
+scikit-learn = "*"
+aiofile = "*"
 
 [requires]
 python_version = "3.6"
